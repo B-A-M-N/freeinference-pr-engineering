@@ -1,0 +1,47 @@
+# FreeInference provider profile for the Mistral Vibe Code CLI.
+#
+# Install: copy the [[providers]] block into your Vibe CLI provider
+# configuration (e.g. ~/.vibe/config.toml or the profile the CLI loads).
+# Do not remove or overwrite other provider blocks or profiles.
+#
+# Export the key in your shell environment; never write the key itself here:
+#   export FREEINFERENCE_API_KEY="hyi-..."
+
+[[providers]]
+name = "freeinference"
+api_base = "https://freeinference.org/v1"
+api_key_env_var = "FREEINFERENCE_API_KEY"
+api_style = "openai"
+backend = "generic"
+
+# Model presets confirmed against GET /v1/models on 2026-11-16.
+# Both chat models declare: tools, json_mode, structured_outputs.
+# Streaming (SSE) verified; context limits below match the catalog.
+
+[models.qwen3_6_35b]
+provider = "freeinference"
+model_id = "qwen3.6-35b"
+context_window = 262144
+max_output_tokens = 8192
+supports_tools = true
+supports_streaming = true
+# High-speed general model: orchestration, review, packaging.
+
+[models.deepseek_v4_flash]
+provider = "freeinference"
+model_id = "deepseek-v4-flash"
+context_window = 1000000
+max_output_tokens = 32768
+supports_tools = true
+supports_streaming = true
+reasoning = true
+# Long-context model: investigation, implementation, verification.
+
+# Active PR engineering profile: use FreeInference for PR missions.
+[profiles.pr-engineering]
+default_model = "qwen3_6_35b"
+investigation_model = "deepseek_v4_flash"
+implementation_model = "deepseek_v4_flash"
+review_model = "qwen3_6_35b"
+verification_model = "deepseek_v4_flash"
+packaging_model = "qwen3_6_35b"
