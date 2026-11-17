@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -154,7 +155,17 @@ func runAdapter(t *testing.T, artifactDir string, timeout time.Duration, pkg Tas
 	if fiPrBin == "" {
 		t.Skip("FI_PR_BIN not set; build the fi-pr venv first")
 	}
-	adapter := NewCommandAdapter("fi", fiPrBin+" runner-task {{.PackageFile}}", artifactDir, timeout)
+	return runAdapterTemplate(t, artifactDir, timeout, pkg, fiPrBin+" runner-task {{.PackageFile}}")
+}
+
+// runAdapterTemplate dispatches through Runner's real CommandAdapter with a
+// custom command template. The hardening subtest uses it to inject the
+// audit/runner-hardening package fields (candidateSha, verdictFile, readOnly,
+// maxDurationSeconds, maxTokens) into the marshaled package JSON before the
+// bridge reads it — master's TaskPackage struct cannot carry them.
+func runAdapterTemplate(t *testing.T, artifactDir string, timeout time.Duration, pkg TaskPackage, template string) *Collect {
+	t.Helper()
+	adapter := NewCommandAdapter("fi", template, artifactDir, timeout)
 	runID, err := adapter.Start(t.Context(), pkg)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -431,5 +442,74 @@ func TestFIBridgeContract(t *testing.T) {
 			t.Fatal("tamper simulation broken")
 		}
 		t.Logf("verifier OK: decision=%s provenance=%s result-digest=%.12s", v.Decision, v.ReviewerProvenance, digest)
+	})
+
+	t.Run("verifier_hardening_fields_verdict_file", func(t *testing.T) {
+		endpoint := fiEndpoint(t, 0)
+		if endpoint != "" {
+			t.Setenv("FREEINFERENCE_BASE_URL", endpoint)
+		}
+		t.Setenv("FI_STATE_PATH", filepath.Join(t.TempDir(), "state.db"))
+		fiPrBin := os.Getenv("FI_PR_BIN")
+		root := t.TempDir()
+		wt, base := newWorktree(t)
+		gitRun(t, wt, "checkout", "-q", "-b", "runner/task")
+		if err := os.WriteFile(filepath.Join(wt, "src.py"), []byte("VALUE = 2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, wt, "add", "-A")
+		gitRun(t, wt, "commit", "-q", "-m", "candidate")
+		candidate := gitRun(t, wt, "rev-parse", "HEAD")
+
+		pkg := buildPackage(t, root, wt, base, "verifier", "review the hardening candidate", nil)
+		verdictPath := filepath.Join(root, "verdict.json")
+		t.Setenv("FI_TEST_CANDIDATE_SHA", candidate)
+		t.Setenv("FI_TEST_VERDICT_FILE", verdictPath)
+		hardenSrc := "import json, os, sys\n" +
+			"p = sys.argv[1]\n\nwith open(p) as f: d = json.load(f)\n" +
+			"d['candidateSha'] = os.environ['FI_TEST_CANDIDATE_SHA']\n" +
+			"d['verdictFile'] = os.environ['FI_TEST_VERDICT_FILE']\n" +
+			"d['readOnly'] = True\nd['maxDurationSeconds'] = 120\nd['maxTokens'] = 100000\n" +
+			"\nwith open(p, 'w') as f: json.dump(d, f, indent=2)\n"
+		hardenPath := pkg.PackageFile + ".harden.py"
+		if err := os.WriteFile(hardenPath, []byte(hardenSrc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		template := fmt.Sprintf("python3 %s.harden.py {{.PackageFile}} && %s runner-task {{.PackageFile}}",
+			"{{.PackageFile}}", fiPrBin)
+		collect := runAdapterTemplate(t, root, 2*time.Minute, pkg, template)
+		if collect.State != "succeeded" {
+			t.Fatalf("state=%s err=%s", collect.State, collect.Err)
+		}
+		if collect.HeadSHA != candidate {
+			t.Fatalf("candidate identity mismatch: %s != %s", collect.HeadSHA, candidate)
+		}
+		data, err := os.ReadFile(verdictPath)
+		if err != nil {
+			t.Fatalf("verdict file: %v", err)
+		}
+		var doc struct {
+			Decision string `json:"decision"`
+			SHA      string `json:"sha"`
+			Evidence []struct {
+				URI    string `json:"uri"`
+				Digest string `json:"digest"`
+			} `json:"evidence"`
+		}
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("verdict document unmarshal: %v", err)
+		}
+		if doc.Decision != "approve" || doc.SHA != candidate || len(doc.Evidence) != 1 {
+			t.Fatalf("flat verdict document wrong: %+v", doc)
+		}
+		diffData, err := os.ReadFile(doc.Evidence[0].URI)
+		if err != nil {
+			t.Fatalf("verdict diff artifact: %v", err)
+		}
+		sum := sha256.Sum256(diffData)
+		if hex.EncodeToString(sum[:]) != doc.Evidence[0].Digest || len(diffData) == 0 {
+			t.Fatal("verdict evidence digest does not match the diff artifact")
+		}
+		t.Logf("hardening verdict OK: sha pinned, evidence digest verified")
 	})
 }

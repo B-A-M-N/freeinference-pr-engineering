@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -43,9 +44,11 @@ class Worktree:
         self.base_ref = base_ref
         self.branch = branch
 
-    def git(self, *argv: str, timeout: int = 600) -> str:
+    def git(self, *argv: str, timeout: int = 600, env: dict[str, str] | None = None) -> str:
+        merged = {**os.environ, **env} if env else None
         proc = subprocess.run(
-            ["git", "-C", str(self.path), *argv], capture_output=True, text=True, timeout=timeout
+            ["git", "-C", str(self.path), *argv], capture_output=True, text=True,
+            timeout=timeout, env=merged,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(argv)} failed: {proc.stderr[-1500:]}")
@@ -577,6 +580,29 @@ class Engine:
         await self.registry.call(ctx, "github_pr_comment",
                                  {"number": job["pr_number"], "body": body})
 
+    def _push_candidate(self, worktree: Worktree, commit_sha: str) -> None:
+        """Push the exact verified commit to the remote branch.
+
+        The published commit must be the verified candidate commit itself, not
+        a reconstruction via the Git data API (which would produce a different
+        SHA and silently break SHA-pinned verification). The token, when needed,
+        is passed through the subprocess environment via a credential helper —
+        never as a command-line argument or remote URL.
+        """
+        if not worktree.git("remote").strip():
+            raise RuntimeError(
+                "publication aborted: worktree has no git remote; the verified "
+                "commit cannot be published as itself"
+            )
+        remote_url = worktree.git("remote", "get-url", "origin").strip()
+        argv: list[str] = []
+        env: dict[str, str] = {}
+        if self.config.github_token and "github.com" in remote_url:
+            helper = '!f() { printf "username=x-access-token\\npassword=%s\\n" "$FI_GH_PUSH_TOKEN"; }; f'
+            argv = ["-c", f"credential.helper={helper}"]
+            env = {"FI_GH_PUSH_TOKEN": self.config.github_token}
+        worktree.git(*argv, "push", "origin", f"HEAD:refs/heads/{worktree.branch}", env=env)
+
     async def _publish_pr(self, job: dict[str, Any], worktree: Worktree, package: PackageReport) -> None:
         ctx = ToolContext(job_id=job["id"], task_id="publish", role="pr_manager",
                           repository=job["repository"], head_branch=worktree.branch,
@@ -584,17 +610,15 @@ class Engine:
                           env={"GITHUB_TOKEN": self.config.github_token,
                                "GITHUB_API_URL": self.config.github_api})
         commit_sha = worktree.git("rev-parse", "HEAD").strip()
-        await self.registry.call(ctx, "github_create_branch",
-                                 {"branch": worktree.branch, "from_ref": commit_sha})
-        files = []
-        diff_files = worktree.git("diff", "--name-only", worktree.base_ref or "HEAD").split()
-        for path in diff_files[:50]:
-            target = worktree.path / path
-            if target.is_file():
-                files.append({"path": path, "content": target.read_text(errors="replace")})
-        if files:
-            await self.registry.call(ctx, "github_commit_files",
-                                     {"branch": worktree.branch, "message": package.title, "files": files})
+        self._push_candidate(worktree, commit_sha)
+        remote_head = worktree.git("ls-remote", "origin", f"refs/heads/{worktree.branch}").split()
+        if not remote_head or remote_head[0] != commit_sha:
+            published = remote_head[0] if remote_head else "<missing>"
+            raise RuntimeError(
+                f"publication aborted: remote branch {worktree.branch} is at {published}, "
+                f"but the verified candidate is {commit_sha}; refusing to open a PR "
+                "from a commit that was not the one verified"
+            )
         base = job.get("pr_number")
         base_branch = ""
         if base:

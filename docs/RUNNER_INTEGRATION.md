@@ -179,10 +179,12 @@ The bridge writes `{packageFile}.result.json` next to Runner's package file
 inside Runner's artifact dir. In `internal/workers/command.go`, the `Collect`
 path currently derives HeadSHA via `git rev-parse HEAD`. Add: read
 `{packageFile}.result.json` if present; on parse success use its `state`,
-`head_sha`, `commits`, `result` (verdict/report JSON), and `error` fields, and
+`headSha`, `commits`, `result` (verdict/report JSON), and `error` fields, and
 record the file's sha256 as the evidence `Digest`. Keep the existing
-`git rev-parse HEAD` cross-check: if the collected `head_sha` differs from the
+`git rev-parse HEAD` cross-check: if the collected `headSha` differs from the
 worktree HEAD, fail the attempt (matching Runner's `RequireHeadSHAPinning`).
+For verifier attempts, additionally ingest the verdict document from the
+package's `verdictFile` via `verification.ReadReviewVerdict()` (see §4.3-bis).
 
 ### 4.3 VerdictFile secure transfer **(A — design, local-branch dependent)**
 
@@ -207,6 +209,33 @@ verdict artifact. Recommended design (works for both command and HTTP adapters):
 This preserves the verification contract: the verdict is an artifact with a
 digest and pinned SHA, not a model-generated success message.
 
+### 4.3-bis Verdict document contract (source-verified by the local audit)
+
+The hardening branch's verifier packages carry `baseSha` (task baseline),
+`candidateSha` (exact candidate under review), `verdictFile` (where the
+independent-review decision must be written), `readOnly`,
+`maxDurationSeconds`, and `maxTokens`. The FI bridge now implements all of
+them:
+
+- Verifier packages bind the worktree HEAD to `candidateSha` (fallback:
+  `baseSha` for master-style packages); implementer/planner bind to `baseSha`.
+- The effective diff is `git diff baseSha..candidateSha` when the two differ.
+- When `verdictFile` is set, the bridge writes Runner's flat document:
+  `{"decision", "sha": <candidate>, "evidence": [{"uri", "digest"}]}` where
+  `digest` is the SHA-256 of the diff artifact written at `<verdictFile>.diff`.
+  Runner should recompute that digest itself — FI's digest is advisory.
+- `readOnly` refuses implementer edits; `maxTokens` aborts on exhaustion;
+  `maxDurationSeconds` tightens the time budget; an empty `allowedPaths`
+  denies every write (deny-by-default).
+- The FI verdict carries `reviewer_provenance: fi_self_review` and
+  `grants_publication_authority: false`; it must not satisfy the
+  independent-review qualification gate on its own.
+
+**Runner-side note**: the hardening `CommandAdapter` must mount/allow the
+`verdictFile` destination inside the sandbox (see §4.6 correction), and
+`verification.ReadReviewVerdict()` should validate `sha` against the attempt's
+pinned candidate SHA and each evidence digest against the referenced artifact.
+
 ### 4.4 External review ingestion
 
 Map the FI `review-import` record onto Runner's `ManualAdapter.ImportReceipt`
@@ -230,8 +259,18 @@ operator-provided, non-authenticated evidence.
 
 ### 4.6 Security boundaries to preserve
 
-- `--unshare-net` stays for untrusted work **(A)**; FI inference runs in the
-  adapter process, not inside untrusted sandboxes.
+- `--unshare-net` stays for untrusted work **(A)**. **Corrected after the local
+  audit**: when sandboxing is enabled, Runner's `CommandAdapter` runs the FI
+  executable itself inside Bubblewrap — so FI inference DOES run inside the
+  sandbox namespace, which disables networking and does not mount the FI venv,
+  FI state directory, or the result/verdict-file destinations. The earlier
+  claim that FI inference executes outside the sandbox was wrong. Resolutions:
+  (a) Runner-side bind-flags for exactly the FI venv, state dir, and
+  per-attempt artifact paths (no general network), or (b) an HTTP worker
+  reached through a loopback-only path, or (c) keep network isolation and run
+  FI inference in a Runner-side broker the sandbox talks to over a mounted
+  Unix socket. Until one of these ships, sandboxed FI workers cannot reach the
+  inference endpoint and the harness result below does NOT exercise Bubblewrap.
 - FI bridge gets no GitHub credentials in Runner mode (`ctx.env = {}`).
 - No auto-merge; external/automated review never grants publish authority.
 - Idempotency keys prevent duplicate runs on retry/restart; never let both
@@ -250,12 +289,15 @@ operator-provided, non-authenticated evidence.
 
 ## 6. Tests passed (this repo, mocked FI — real-FI smoke not run here: no key in sandbox)
 
-- Full Python suite: **112 passed** (`pytest -q`), including:
-  - `tests/test_runner_bridge.py` (26): role mapping (no GitHub tools), registry restriction, honest unsupported-role failure, non-git worktree rejection, **candidate SHA binding with zero FI calls on stale candidate**, scoped edits + commit + `head_sha`, allowed/forbidden path enforcement, idempotent replay (result file rewritten with `replayed: true`), verifier verdict (decision / candidate_sha / 64-hex diff_digest / evidence_kind / `fi_self_review` provenance), implementer denied `run_commands`, symlinked-target edit rejection, bounded manual-review ingestion, oversized-submission rejection, verifier diff fallback to trunk merge-base, blocker-based rejection, cancellation → `cancelled`, runner job persisted for restart recovery, path globs, package roundtrip, review packet contents, manual review import (operator evidence + findings + event note), stale-candidate rejection, malformed verdict rejection, result-file Runner `Collect` schema.
+- Full Python suite: **119 passed** (`pytest -q`), including:
+  - `tests/test_runner_bridge.py` (32): role mapping (no GitHub tools), registry restriction, honest unsupported-role failure, non-git worktree rejection, **candidate SHA binding with zero FI calls on stale candidate**, scoped edits + commit + `head_sha`, allowed/forbidden path enforcement, idempotent replay (result file rewritten with `replayed: true`), verifier verdict (decision / candidate_sha / 64-hex diff_digest / evidence_kind / `fi_self_review` provenance), implementer denied `run_commands`, symlinked-target edit rejection, bounded manual-review ingestion, oversized-submission rejection, verifier diff fallback to trunk merge-base, blocker-based rejection, cancellation → `cancelled`, runner job persisted for restart recovery, path globs, package roundtrip, review packet contents, manual review import (operator evidence + findings + event note), stale-candidate rejection, malformed verdict rejection, result-file Runner `Collect` schema.
   - `tests/test_integration_regressions.py` (13): strict approval identity matching, credential-free sandbox env, credential-free untrusted command execution, `..` traversal rejection, symlink escape rejection, non-destructive worktree recovery.
   - All pre-existing Mission-2 tests still pass.
-- Go contract suite: **8/8 subtests pass** through Runner's real `CommandAdapter`
-  (see §8).
+- Go contract suite: **9/9 subtests pass** through Runner's real `CommandAdapter`
+  (see §8) — including a hardening-style verifier package (candidateSha +
+  verdictFile + readOnly + budgets) validated end-to-end.
+  **Caveat**: the harness runs outside Bubblewrap, so it validates the
+  adapter/bridge contract, not production sandbox behavior (see §4.6).
 
 ## 7. What remains unverified
 
@@ -280,6 +322,13 @@ operator-provided, non-authenticated evidence.
 6. **Runner qualification machinery end-to-end** — the harness exercises the
    adapter contract, not Runner's `scheduler/review.go` → `verification/`
    pipeline; that requires the local hardening branch.
+7. **Sandboxed execution** — the harness runs outside Bubblewrap; whether FI
+   workers can reach the inference endpoint and write the result/verdict files
+   inside the hardening sandbox is untested (needs the Runner-side mounts or
+   broker from §4.6).
+8. **Budget accounting in Runner** — FI reports token usage in `Collect.usage`,
+   but Runner-side accumulation/enforcement against `maxTokens`/`budgetUsd` is
+   a Runner-side change and is unverified.
 
 ## 8. Mission 4 — integration qualification (Go contract harness)
 
@@ -295,7 +344,12 @@ operator-provided, non-authenticated evidence.
 | Idempotency | `IdempotencyKey` in package | replay returns prior result with `replayed: true`, no re-inference | ✅ harness: duplicate task → ≤1 FI call |
 | Cancel | SIGTERM process group, SIGKILL after 5s | subprocess terminates → state `cancelled` | ✅ harness |
 | Deadline | `context.WithTimeout` → failed "worker exceeded its time budget" | honest failure, no fake success | ✅ harness |
-| Candidate SHA | `baseSha`; `HeadSHA` via `git rev-parse HEAD` | stale candidate → zero inference, error `candidate SHA moved` | ✅ harness + pytest |
+| Candidate SHA | master: `baseSha`. Hardening (audit-verified): `baseSha` = task baseline, `candidateSha` = exact candidate; verifier binds to `candidateSha` | verifier binds HEAD to `candidateSha` (fallback `baseSha`); implementer/planner bind to `baseSha`; stale candidate → zero inference, error `candidate SHA moved` | ✅ harness + pytest |
+| Verifier diff | hardening: `baseSha`..`candidateSha` | exact range diff when the SHAs differ; merge-base/parent fallback for master-style packages | ✅ harness + pytest |
+| Verdict document | `verdictFile` + `verification.ReadReviewVerdict()` expecting `{decision, sha, evidence:[{uri,digest}]}` | flat document written to `verdictFile`; diff artifact at `<verdictFile>.diff`; SHA-256 digest of the artifact | ✅ harness + pytest (Runner-side ingestion still pending) |
+| `readOnly` / `maxDurationSeconds` / `maxTokens` | hardening package fields | readOnly refuses implementer edits; duration tightens the time budget; token budget aborts on exhaustion | ✅ pytest |
+| Path scope | hardening: empty allowlist must not be permissive | empty `allowedPaths` denies every write; forbidden globs win; traversal/symlink escapes rejected | ✅ pytest |
+| Commit isolation | previously staged index content must not enter the worker's commit | pathspec commit of exactly the applied paths; post-commit verification fails on any extra path | ✅ pytest |
 | Verifier diff | verifier packages carry candidate SHA as `baseSha` (empty `git diff baseSha` is the *correct* case) | `_candidate_diff` fallback chain: `git diff baseSha` → trunk merge-base → parent commit | ✅ fixed (3rd discrepancy) |
 | Review provenance | FI self-review must not qualify as external review | verdict carries `reviewer_provenance: fi_self_review`, `grants_publication_authority: false`; manual imports carry `provenance: operator_provided` | ✅ implemented + tested |
 | Evidence ingestion | bounded, schema-validated | 1 MB submission bound; findings capped (50 findings × 20 evidence × 4000 chars) | ✅ tested |
@@ -339,4 +393,30 @@ FREEINFERENCE_API_KEY=... scripts/runner_qualification_live.sh
   adapter process only.
 - Scope enforcement is re-validated against traversal, symlink escapes, and
   disallowed/forbidden paths at apply time (tested).
+
+### 8.5 Local-audit corrections (round 2)
+
+The operator's local audit of `audit/runner-hardening` (HEAD `628c277`) found
+contract divergences; the FI-side fixes:
+
+1. **Hardening package fields** — `candidateSha`, `verdictFile`, `readOnly`,
+   `maxDurationSeconds`, `maxTokens` were missing; now parsed (null-tolerant)
+   and enforced.
+2. **Verifier SHA binding** — was pinned to `baseSha` (which hardening uses for
+   the task baseline); now binds to `candidateSha` with `baseSha` fallback.
+3. **Flat verdict document** — FI's nested verdict did not satisfy
+   `ReadReviewVerdict()`; the bridge now also writes the flat document to
+   `verdictFile` with a verifiable diff-artifact digest.
+4. **Sandbox reality** — corrected the false claim that FI inference runs
+   outside the Bubblewrap namespace (see §4.6); sandboxed FI workers currently
+   cannot reach the inference endpoint without a Runner-side mount/socket
+   change.
+5. **Empty allowlist** — was allow-all; now deny-by-default.
+6. **Commit isolation** — previously staged index content could enter the
+   FI commit; commits are now pathspec-scoped and verified.
+7. **Publication SHA fidelity (standalone mode)** — `_publish_pr` reconstructed
+   the remote commit via the Git data API, producing a different SHA than the
+   verified candidate; it now pushes the exact verified commit and aborts
+   unless `ls-remote` confirms the remote branch head equals the candidate SHA.
+   Token transport uses an env-based credential helper (never argv/URL).
 

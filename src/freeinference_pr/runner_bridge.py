@@ -16,9 +16,13 @@ runtime:
   the bridge never clones or creates workspaces of its own.
 - File edits are restricted to ``allowedPaths`` and excluded by
   ``forbiddenPaths``.
-- The candidate SHA is bound: the worktree HEAD must equal ``baseSha`` before
-  work starts, and the resulting HEAD is reported for Runner's SHA-pinned
-  verification.
+- The candidate SHA is bound: implementer/planner packages bind the worktree
+  HEAD to ``baseSha``; verifier packages bind to ``candidateSha`` (Runner
+  hardening) or ``baseSha`` when no candidate SHA is provided, and the
+  resulting HEAD is reported for Runner's SHA-pinned verification.
+- Hardening fields are enforced: ``readOnly`` refuses all edits,
+  ``maxDurationSeconds`` and ``maxTokens`` bound execution, and an empty
+  ``allowedPaths`` list denies every write (deny-by-default).
 - Execution is idempotent per ``idempotencyKey``: replaying a package returns
   the recorded result instead of re-running (retry/restart safety).
 - Time budget (``maxMinutes``) is enforced; expiry is reported honestly as a
@@ -113,6 +117,14 @@ class RunnerTaskPackage(BaseModel):
     idempotencyKey: str = ""
     packageFile: str = ""
 
+    # Runner hardening branch (audit/runner-hardening) additions. Optional so
+    # master-style packages still parse; enforced whenever present.
+    candidateSha: str = ""
+    verdictFile: str = ""
+    readOnly: bool = False
+    maxDurationSeconds: int = 0
+    maxTokens: int = 0
+
     @field_validator(
         "acceptance", "nonGoals", "allowedPaths", "forbiddenPaths", "evidence",
         mode="before",
@@ -120,6 +132,21 @@ class RunnerTaskPackage(BaseModel):
     @classmethod
     def _null_list_to_empty(cls, value: Any) -> Any:
         return [] if value is None else value
+
+    @field_validator("baseSha", "candidateSha", "verdictFile", mode="before")
+    @classmethod
+    def _null_str_to_empty(cls, value: Any) -> Any:
+        return "" if value is None else value
+
+    @field_validator("readOnly", mode="before")
+    @classmethod
+    def _null_bool_to_false(cls, value: Any) -> Any:
+        return False if value is None else value
+
+    @field_validator("maxDurationSeconds", "maxTokens", "maxMinutes", "attemptNo", mode="before")
+    @classmethod
+    def _null_int_to_zero(cls, value: Any) -> Any:
+        return 0 if value is None else value
 
 
 class RunnerBridgeError(Exception):
@@ -135,7 +162,8 @@ def path_allowed(relative: str, allowed: list[str], forbidden: list[str]) -> boo
     """Scope check against Runner's allowed/forbidden path lists (fnmatch globs).
 
     Absolute paths and any path that escapes the worktree (``..`` segments) are
-    never allowed, regardless of the configured globs.
+    never allowed, regardless of the configured globs. An empty allowlist
+    denies every write (deny-by-default, matching Runner hardening semantics).
     """
     import fnmatch
     import os
@@ -151,7 +179,7 @@ def path_allowed(relative: str, allowed: list[str], forbidden: list[str]) -> boo
         if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(f"/{normalized}", pattern):
             return False
     if not allowed:
-        return True
+        return False
     return any(fnmatch.fnmatch(normalized, pattern) for pattern in allowed)
 
 
@@ -245,13 +273,23 @@ async def _run_runner_task(pkg: RunnerTaskPackage, config: FIConfig, store: Stor
     store.update_job(job["id"], status="running", stage="RUNNER_TASK")
     head = _git(worktree, "rev-parse", "HEAD").strip()
     result["head_sha"] = head
-    if pkg.baseSha and head != pkg.baseSha:
+    candidate_sha = pkg.candidateSha or pkg.baseSha
+    expected = candidate_sha if pkg.role == "verifier" else pkg.baseSha
+    if expected and head != expected:
         result["state"] = "failed"
         result["error"] = (
-            f"candidate SHA moved: worktree HEAD {head} != package baseSha {pkg.baseSha}; "
+            f"candidate SHA moved: worktree HEAD {head} != package {expected}; "
             "refusing to act on a stale candidate"
         )
-        store.log_event(job["id"], "runner", "sha_binding_failed", {"head": head, "base": pkg.baseSha})
+        store.log_event(job["id"], "runner", "sha_binding_failed", {
+            "head": head, "expected": expected, "baseSha": pkg.baseSha,
+            "candidateSha": pkg.candidateSha,
+        })
+        return _finish(store, pkg, idem_key, result)
+    if pkg.readOnly and pkg.role == "implementer":
+        result["state"] = "failed"
+        result["error"] = "package is readOnly; the implementer may not modify the candidate"
+        store.log_event(job["id"], "runner", "read_only_violation", {"role": pkg.role})
         return _finish(store, pkg, idem_key, result)
 
     role = ROLE_MAPPING[pkg.role]
@@ -272,14 +310,18 @@ async def _run_runner_task(pkg: RunnerTaskPackage, config: FIConfig, store: Stor
         context_blocks.append(("Acceptance evidence", "\n".join(pkg.evidence)))
 
     try:
+        bounds = [b for b in (pkg.maxMinutes * 60.0, float(pkg.maxDurationSeconds)) if b > 0]
+        timeout = max(5.0, min(bounds)) if bounds else 1800.0
         result = await asyncio.wait_for(
             _execute_role(pkg, role, runtime, ctx, context_blocks, untrusted, store, job, result, config),
-            timeout=max(60.0, pkg.maxMinutes * 60.0),
+            timeout=timeout,
         )
     except asyncio.TimeoutError:
         result["state"] = "cancelled"
-        result["error"] = f"time budget exhausted ({pkg.maxMinutes} minutes)"
-        store.log_event(job["id"], "runner", "runner_task_timeout", {"maxMinutes": pkg.maxMinutes})
+        result["error"] = "time budget exhausted"
+        store.log_event(job["id"], "runner", "runner_task_timeout", {
+            "maxMinutes": pkg.maxMinutes, "maxDurationSeconds": pkg.maxDurationSeconds,
+        })
         store.update_job(job["id"], status="cancelled")
         return _finish(store, pkg, idem_key, result)
     except asyncio.CancelledError:
@@ -360,17 +402,35 @@ def _write_result_file(pkg: RunnerTaskPackage, result: dict[str, Any]) -> None:
         pass
 
 
+async def _bounded_run(
+    runtime: AgentRuntime, ctx: ToolContext, model: str, prompt: str,
+    context_blocks: list[tuple[str, str]], schema: type, untrusted: set[str],
+    pkg: RunnerTaskPackage, spent: dict[str, int],
+):
+    agent_result = await runtime.run(
+        ctx, model, prompt, context_blocks, schema, untrusted_sources=untrusted,
+    )
+    spent["tokens"] += int((agent_result.usage or {}).get("total_tokens", 0))
+    if pkg.maxTokens and spent["tokens"] > pkg.maxTokens:
+        raise RunnerBridgeError(
+            f"token budget exhausted: {spent['tokens']} tokens used, budget {pkg.maxTokens}"
+        )
+    return agent_result
+
+
 async def _execute_role(
     pkg: RunnerTaskPackage, role: str, runtime: AgentRuntime, ctx: ToolContext,
     context_blocks: list[tuple[str, str]], untrusted: set[str], store: Store,
     job: dict[str, Any], result: dict[str, Any], config: FIConfig,
+    spent: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    spent = spent if spent is not None else {"tokens": 0}
     if role == "repository_analyst":
-        agent_result = await runtime.run(
-            ctx, config.model_for(role),
+        agent_result = await _bounded_run(
+            runtime, ctx, config.model_for(role),
             f"Analyze this task and produce a bounded implementation plan. "
             f"Goal: {pkg.goal or pkg.title}. Instructions: {pkg.instructions}",
-            context_blocks, AnalysisReport, untrusted_sources=untrusted,
+            context_blocks, AnalysisReport, untrusted, pkg, spent,
         )
         report = agent_result.structured
         if not isinstance(report, AnalysisReport):
@@ -378,11 +438,11 @@ async def _execute_role(
         result["result"] = report.model_dump_json()
         result["state"] = "succeeded"
     elif role == "implementer":
-        agent_result = await runtime.run(
-            ctx, config.model_for(role),
+        agent_result = await _bounded_run(
+            runtime, ctx, config.model_for(role),
             f"Implement this task as bounded file edits plus regression tests. "
             f"Goal: {pkg.goal or pkg.title}. Instructions: {pkg.instructions}",
-            context_blocks, EditsReport, untrusted_sources=untrusted,
+            context_blocks, EditsReport, untrusted, pkg, spent,
         )
         edits_report = agent_result.structured
         if not isinstance(edits_report, EditsReport):
@@ -396,34 +456,40 @@ async def _execute_role(
         result["result"] = edits_report.model_dump_json()
         result["state"] = "succeeded"
     else:
-        agent_result = await runtime.run(
-            ctx, config.model_for(role),
+        agent_result = await _bounded_run(
+            runtime, ctx, config.model_for(role),
             "Review the effective diff of this candidate for correctness and security. "
             "Run the relevant checks and report actual exit codes. Produce a review "
             "verdict: assessment, findings with severity and evidence, and missed paths. "
             "An empty blocker list means you found no blocking defect.",
-            context_blocks, ReviewReport, untrusted_sources=untrusted,
+            context_blocks, ReviewReport, untrusted, pkg, spent,
         )
         review = agent_result.structured
         if not isinstance(review, ReviewReport):
             raise RunnerBridgeError("reviewer reply did not parse as a ReviewReport")
-        diff = _candidate_diff(ctx.worktree, pkg.baseSha)
+        candidate_sha = pkg.candidateSha or pkg.baseSha
+        if pkg.candidateSha and pkg.baseSha and pkg.candidateSha != pkg.baseSha:
+            diff = _git(ctx.worktree, "diff", f"{pkg.baseSha}..{pkg.candidateSha}")
+        else:
+            diff = _candidate_diff(ctx.worktree, candidate_sha)
         blockers = [f for f in review.findings if f.severity in RUNNER_BLOCKER_SEVERITIES]
-        result["result"] = json.dumps(redact_obj({
-            "verdict": {
-                "decision": "reject" if blockers else "approve",
-                "candidate_sha": _git(ctx.worktree, "rev-parse", "HEAD").strip(),
-                "base_sha": pkg.baseSha,
-                "diff_digest": _sha256(diff),
-                "evidence_kind": "fi_review",
-                "reviewer_provenance": "fi_self_review",
-                "grants_publication_authority": False,
-                "assessment": review.assessment,
-                "findings": [f.model_dump() for f in review.findings],
-                "missed_paths": review.missed_paths,
-                "unsupported_assumptions": review.unsupported_assumptions,
-            }
-        }))
+        verdict = {
+            "decision": "reject" if blockers else "approve",
+            "candidate_sha": _git(ctx.worktree, "rev-parse", "HEAD").strip(),
+            "base_sha": pkg.baseSha,
+            "diff_digest": _sha256(diff),
+            "evidence_kind": "fi_review",
+            "reviewer_provenance": "fi_self_review",
+            "grants_publication_authority": False,
+            "assessment": review.assessment,
+            "findings": [f.model_dump() for f in review.findings],
+            "missed_paths": review.missed_paths,
+            "unsupported_assumptions": review.unsupported_assumptions,
+        }
+        verdict_ref = _write_verdict_file(pkg, verdict, diff)
+        if verdict_ref:
+            result["verdict_file"] = verdict_ref["verdict_file"]
+        result["result"] = json.dumps(redact_obj({"verdict": verdict}))
         result["state"] = "succeeded"
         store.add_artifact(job["id"], "runner_review", ref=result["result"])
 
@@ -435,14 +501,46 @@ async def _execute_role(
 
 
 
+def _write_verdict_file(
+    pkg: RunnerTaskPackage, verdict: dict[str, Any], diff: str
+) -> dict[str, str] | None:
+    """Write the Runner hardening verdict document when ``verdictFile`` is set.
+
+    Runner's ``verification.ReadReviewVerdict()`` expects a flat document:
+    ``{"decision", "sha", "evidence": [{"uri", "digest"}]}`` where ``sha`` is
+    the exact candidate SHA and each digest is the SHA-256 of the referenced
+    artifact. The effective diff is written next to the verdict so Runner can
+    recompute the digest independently. FI's nested review verdict stays in the
+    result payload; the flat document is additive, never a publication
+    authority.
+    """
+    if not pkg.verdictFile:
+        return None
+    path = Path(pkg.verdictFile)
+    diff_path = path.with_name(path.name + ".diff")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text(diff)
+    diff_path.chmod(0o600)
+    doc = {
+        "decision": verdict["decision"],
+        "sha": verdict["candidate_sha"],
+        "evidence": [{"uri": str(diff_path), "digest": _sha256(diff)}],
+    }
+    path.write_text(json.dumps(doc, indent=2))
+    path.chmod(0o600)
+    return {"verdict_file": str(path), "verdict_diff_uri": str(diff_path),
+            "verdict_diff_digest": doc["evidence"][0]["digest"]}
+
+
 def _candidate_diff(worktree: Path, base_sha: str) -> str:
     """Effective diff of the candidate under review.
 
-    Runner's verifier packages carry the candidate SHA as ``baseSha`` (the SHA
-    the review must be pinned to), so ``git diff <baseSha>`` is empty exactly
-    when the binding is correct. In that case the candidate diff is the
-    branch's changes against its trunk merge-base, falling back to the tip
-    commit for detached single-commit candidates.
+    Fallback for master-style verifier packages where the candidate SHA is
+    carried as ``baseSha``: ``git diff <baseSha>`` is then empty exactly when
+    the binding is correct, and the candidate diff is the branch's changes
+    against its trunk merge-base, falling back to the tip commit for detached
+    single-commit candidates. Hardening packages with distinct ``baseSha`` and
+    ``candidateSha`` never reach this path (they use ``diff baseSha..candidateSha``).
     """
     if base_sha:
         diff = _git(worktree, "diff", base_sha)
@@ -494,12 +592,25 @@ def _apply_scoped_edits(
 def _commit_scoped(
     pkg: RunnerTaskPackage, worktree: Path, paths: list[str], message: str
 ) -> str | None:
+    """Commit only the applied edit paths.
+
+    Pathspec commits keep previously staged, unrelated index content out of the
+    FI-generated commit; the resulting commit is verified to contain exactly
+    the applied paths.
+    """
     if not paths:
         return None
     _git(worktree, "add", "-A", "--", *paths)
-    if not _git(worktree, "status", "--porcelain").strip():
+    pending = _git(worktree, "diff", "--cached", "--name-only", "--", *paths)
+    if not pending.strip():
         return None
-    _git(worktree, "commit", "-m", message)
+    _git(worktree, "commit", "-m", message, "--", *paths)
+    committed = _git(worktree, "show", "--name-only", "--format=", "HEAD").split()
+    unexpected = sorted(set(committed) - set(paths))
+    if unexpected:
+        raise RunnerBridgeError(
+            f"commit isolation violated: {unexpected} entered the FI commit"
+        )
     return _git(worktree, "rev-parse", "HEAD").strip()
 
 

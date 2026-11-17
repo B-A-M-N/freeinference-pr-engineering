@@ -164,10 +164,22 @@ async def test_forbidden_paths_block_edits(tmp_path, worktree, monkeypatch):
              "commit_message": "m", "regression_tests": [], "notes": ""}
     patch_client(monkeypatch, lambda m, ms: fj(EDITS))
     config = make_config(tmp_path)
-    pkg = make_pkg(worktree, allowedPaths=[], forbiddenPaths=["src.py"])
+    pkg = make_pkg(worktree, allowedPaths=["src.py"], forbiddenPaths=["src.py"])
     result = await run_runner_task(pkg, config)
     assert result["state"] == "failed"
     assert "outside allowed scope" in result["error"]
+
+
+async def test_empty_allowlist_denies_all_edits(tmp_path, worktree, monkeypatch):
+    EDITS = {"edits": [{"path": "src.py", "content": "VALUE = 3\n"}],
+             "commit_message": "m", "regression_tests": [], "notes": ""}
+    fake = patch_client(monkeypatch, lambda m, ms: fj(EDITS))
+    config = make_config(tmp_path)
+    pkg = make_pkg(worktree, allowedPaths=[], forbiddenPaths=[])
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "failed"
+    assert "outside allowed scope" in result["error"]
+    assert fake.calls == 1
 
 
 async def test_idempotency_replay_does_not_rerun(tmp_path, worktree, monkeypatch):
@@ -246,7 +258,7 @@ def test_path_allowed_globs():
     assert path_allowed("src/a.py", ["src/*"], [])
     assert not path_allowed("docs/x.md", ["src/*"], [])
     assert not path_allowed("src/secrets.py", ["src/*"], ["src/secrets*"])
-    assert path_allowed("anything.txt", [], []), "empty allowed list permits all"
+    assert not path_allowed("anything.txt", [], []), "empty allowlist denies all writes"
     assert not path_allowed("../escape.py", ["*"], [])
 
 
@@ -442,3 +454,92 @@ async def test_verifier_diff_falls_back_to_trunk_merge_base(tmp_path, worktree, 
         capture_output=True, text=True).stdout
     import hashlib
     assert verdict["diff_digest"] == hashlib.sha256(expected.encode()).hexdigest()
+
+
+async def test_verifier_hardening_candidate_sha_and_verdict_file(tmp_path, worktree, monkeypatch):
+    """Hardening-style verifier package: baseSha is the task baseline, candidateSha
+    the exact candidate; the verdict document goes to verdictFile in Runner's
+    flat ReadReviewVerdict shape with a verifiable evidence digest."""
+    REVIEW = {"assessment": "fine", "findings": [], "missed_paths": [], "unsupported_assumptions": []}
+    fake = patch_client(monkeypatch, lambda m, ms: fj(REVIEW))
+    config = make_config(tmp_path)
+    base = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(worktree), "checkout", "-q", "-b", "runner/task"], check=True)
+    (worktree / "src.py").write_text("VALUE = 2\n")
+    subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "commit", "-q", "-m", "candidate"], check=True)
+    candidate = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+    verdict_path = tmp_path / "verdicts" / "att-1.json"
+    pkg = make_pkg(worktree, role="verifier", baseSha=base, candidateSha=candidate,
+                   verdictFile=str(verdict_path), readOnly=True,
+                   maxDurationSeconds=120, maxTokens=100000)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "succeeded", result["error"]
+    assert fake.calls == 1
+    doc = json.loads(verdict_path.read_text())
+    assert set(doc) == {"decision", "sha", "evidence"}
+    assert doc["decision"] == "approve"
+    assert doc["sha"] == candidate
+    diff = subprocess.run(["git", "-C", str(worktree), "diff", f"{base}..{candidate}"],
+                          capture_output=True, text=True).stdout
+    import hashlib
+    assert doc["evidence"][0]["digest"] == hashlib.sha256(diff.encode()).hexdigest()
+    assert Path(doc["evidence"][0]["uri"]).read_text() == diff
+    payload = json.loads(result["result"])["verdict"]
+    assert payload["candidate_sha"] == candidate
+    assert payload["grants_publication_authority"] is False
+    assert result["verdict_file"] == str(verdict_path)
+
+
+async def test_verifier_rejects_stale_candidate_sha(tmp_path, worktree, monkeypatch):
+    fake = patch_client(monkeypatch, lambda m, ms: fj({}))
+    config = make_config(tmp_path)
+    pkg = make_pkg(worktree, role="verifier", candidateSha="0" * 40)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "failed"
+    assert "candidate SHA moved" in result["error"]
+    assert fake.calls == 0
+
+
+async def test_read_only_package_refuses_implementer_edits(tmp_path, worktree, monkeypatch):
+    fake = patch_client(monkeypatch, lambda m, ms: fj({}))
+    config = make_config(tmp_path)
+    pkg = make_pkg(worktree, readOnly=True)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "failed"
+    assert "readOnly" in result["error"]
+    assert fake.calls == 0
+
+
+async def test_token_budget_enforced(tmp_path, worktree, monkeypatch):
+    EDITS = {"edits": [{"path": "src.py", "content": "VALUE = 2\n"}],
+             "commit_message": "bump", "regression_tests": [], "notes": ""}
+    fake = patch_client(monkeypatch, lambda m, ms: fj(EDITS))
+    config = make_config(tmp_path)
+    pkg = make_pkg(worktree, maxTokens=2)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "failed"
+    assert "token budget exhausted" in result["error"]
+    assert fake.calls == 1
+
+
+async def test_commit_isolation_excludes_pre_staged_changes(tmp_path, worktree, monkeypatch):
+    EDITS = {"edits": [{"path": "src.py", "content": "VALUE = 2\n"}],
+             "commit_message": "bump", "regression_tests": [], "notes": ""}
+    patch_client(monkeypatch, lambda m, ms: fj(EDITS))
+    config = make_config(tmp_path)
+    (worktree / "other.py").write_text("X = 999\n")
+    subprocess.run(["git", "-C", str(worktree), "add", "other.py"], check=True)
+    pkg = make_pkg(worktree)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "succeeded", result["error"]
+    committed = subprocess.run(
+        ["git", "-C", str(worktree), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True, text=True).stdout.split()
+    assert committed == ["src.py"]
+    staged = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+        capture_output=True, text=True).stdout.split()
+    assert staged == ["other.py"]

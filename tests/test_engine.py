@@ -352,3 +352,27 @@ async def test_worktree_edits_are_isolated(env, origin, patch_worktree):
     await engine.run_job(job["id"])
     assert (origin / "app.py").read_text() == "VALUE = 1\n", "fixture origin must stay untouched"
     store.close()
+
+
+async def test_publish_pushes_exact_verified_commit(env, origin, patch_worktree, patch_github):
+    """The remote branch must point at the verified candidate commit itself —
+    never a reconstructed API commit with a different SHA."""
+    engine, store, client = make_engine(env, scripted_responder())
+    job = make_job(store)
+    engine.plan(store.get_job(job["id"]))
+    await engine.run_job(job["id"])
+    approval = store.approvals_for_job(job["id"])[0]
+    store.decide_approval(approval["id"], "approved")
+    status = await engine.run_job(job["id"])
+    assert status == "published"
+
+    commits = [a for a in store.artifacts_for_job(job["id"]) if a["kind"] == "commit"]
+    verified_sha = commits[-1]["ref"]
+    remote_branches = subprocess.run(
+        ["git", "-C", str(origin), "for-each-ref", "--format=%(refname:short) %(objectname)",
+         "refs/heads/"], capture_output=True, text=True).stdout.strip().splitlines()
+    matching = [line for line in remote_branches if line.endswith(verified_sha)]
+    assert matching, f"no remote branch at verified SHA {verified_sha}; got {remote_branches}"
+    pr_ops = [op for op in patch_github.operations if op[1].endswith("/pulls") and op[0] == "POST"]
+    assert len(pr_ops) == 1
+    store.close()

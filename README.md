@@ -149,14 +149,14 @@ integration/runner/  Go contract harness against Runner's real CommandAdapter
 scripts/runner_qualification_live.sh  live-FI qualification (user's machine, disposable repo)
   INVENTORY.md             preserved-work inventory (commit 0fb6298 baseline)
   DEPLOYMENT.md            optional Mistral managed path
-tests/               112 offline tests (mocked FI, fake GitHub, local git fixtures)
+tests/               119 offline tests (mocked FI, fake GitHub, local git fixtures)
 ```
 
 ## Development
 
 ```bash
 uv sync
-uv run pytest          # 112 offline tests; no network, no keys needed
+uv run pytest          # 119 offline tests; no network, no keys needed
 ```
 
 Tests are offline by design: FreeInference is mocked at the HTTP boundary,
