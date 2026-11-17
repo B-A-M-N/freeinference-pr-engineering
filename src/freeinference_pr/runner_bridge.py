@@ -47,7 +47,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from freeinference_pr.agent_models import AnalysisReport, EditsReport, ReviewReport
 from freeinference_pr.config import FIConfig
@@ -59,6 +59,11 @@ from freeinference_pr.tools import ToolContext, ToolRegistry, wrap_untrusted
 RUNNER_ROLES = ("planner", "implementer", "verifier")
 
 RUNNER_BLOCKER_SEVERITIES = frozenset({"critical", "high"})
+
+# Bounded ingestion limits for operator-submitted review verdicts.
+MAX_FINDINGS = 50
+MAX_EVIDENCE_PER_FINDING = 20
+MAX_TEXT_LEN = 4000
 
 ROLE_MAPPING = {
     "planner": "repository_analyst",
@@ -78,7 +83,11 @@ RUNNER_MODE_TOOLS = {
 
 
 class RunnerTaskPackage(BaseModel):
-    """Mirror of Runner's TaskPackage (internal/workers/workers.go)."""
+    """Mirror of Runner's TaskPackage (internal/workers/workers.go).
+
+    Go marshals nil slices as JSON null, so every list field tolerates null
+    and normalizes it to an empty list.
+    """
 
     taskId: str
     attemptId: str
@@ -103,6 +112,14 @@ class RunnerTaskPackage(BaseModel):
     stopBehavior: str = ""
     idempotencyKey: str = ""
     packageFile: str = ""
+
+    @field_validator(
+        "acceptance", "nonGoals", "allowedPaths", "forbiddenPaths", "evidence",
+        mode="before",
+    )
+    @classmethod
+    def _null_list_to_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
 
 
 class RunnerBridgeError(Exception):
@@ -211,7 +228,7 @@ async def _run_runner_task(pkg: RunnerTaskPackage, config: FIConfig, store: Stor
     previous = store.idempotency_get(idem_key)
     if previous:
         previous["replayed"] = True
-        return previous
+        return _finish(store, pkg, idem_key, previous)
 
     if pkg.role not in RUNNER_ROLES:
         result["state"] = "failed"
@@ -304,13 +321,41 @@ def _finish(store: Store, pkg: RunnerTaskPackage, idem_key: str, result: dict[st
     return result
 
 
+def _collect_schema(pkg: RunnerTaskPackage, result: dict[str, Any]) -> dict[str, Any]:
+    """Render the result in Runner's Collect JSON shape (internal/workers/workers.go).
+
+    Field names and semantics mirror Runner's Collect struct so the Runner-side
+    collector can unmarshal this file directly. Extra diagnostic fields
+    (taskId, attemptId, replayed) are additive and ignored by strict unmarshals.
+    """
+    usage = result.get("usage") or {}
+    return {
+        "runId": result.get("run_id", f"fi-{pkg.attemptId}"),
+        "state": result.get("state", "unknown"),
+        "headSha": result.get("head_sha", ""),
+        "result": result.get("result", ""),
+        "commits": result.get("commits", []),
+        "usage": {
+            "usd": usage.get("usd", 0),
+            "known": bool(usage.get("known", False)),
+            "tokens": usage.get("tokens", 0),
+            "detail": usage.get("detail", "freeinference"),
+        },
+        "error": result.get("error", ""),
+        "taskId": pkg.taskId,
+        "attemptId": pkg.attemptId,
+        "replayed": bool(result.get("replayed", False)),
+    }
+
+
 def _write_result_file(pkg: RunnerTaskPackage, result: dict[str, Any]) -> None:
     if not pkg.packageFile:
         return
     try:
         path = Path(pkg.packageFile + ".result.json")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(redact_obj(result), indent=2, default=str))
+        payload = _collect_schema(pkg, result)
+        path.write_text(json.dumps(redact_obj(payload), indent=2, default=str))
     except OSError:
         pass
 
@@ -362,7 +407,7 @@ async def _execute_role(
         review = agent_result.structured
         if not isinstance(review, ReviewReport):
             raise RunnerBridgeError("reviewer reply did not parse as a ReviewReport")
-        diff = _git(ctx.worktree, "diff", pkg.baseSha) if pkg.baseSha else _git(ctx.worktree, "diff", "HEAD")
+        diff = _candidate_diff(ctx.worktree, pkg.baseSha)
         blockers = [f for f in review.findings if f.severity in RUNNER_BLOCKER_SEVERITIES]
         result["result"] = json.dumps(redact_obj({
             "verdict": {
@@ -371,6 +416,8 @@ async def _execute_role(
                 "base_sha": pkg.baseSha,
                 "diff_digest": _sha256(diff),
                 "evidence_kind": "fi_review",
+                "reviewer_provenance": "fi_self_review",
+                "grants_publication_authority": False,
                 "assessment": review.assessment,
                 "findings": [f.model_dump() for f in review.findings],
                 "missed_paths": review.missed_paths,
@@ -385,6 +432,36 @@ async def _execute_role(
     })
     store.update_job(job["id"], status="completed", stage="COMPLETED")
     return result
+
+
+
+def _candidate_diff(worktree: Path, base_sha: str) -> str:
+    """Effective diff of the candidate under review.
+
+    Runner's verifier packages carry the candidate SHA as ``baseSha`` (the SHA
+    the review must be pinned to), so ``git diff <baseSha>`` is empty exactly
+    when the binding is correct. In that case the candidate diff is the
+    branch's changes against its trunk merge-base, falling back to the tip
+    commit for detached single-commit candidates.
+    """
+    if base_sha:
+        diff = _git(worktree, "diff", base_sha)
+        if diff.strip():
+            return diff
+    head = _git(worktree, "rev-parse", "HEAD").strip()
+    if base_sha and head != base_sha:
+        return _git(worktree, "diff", base_sha)
+    for trunk in ("main", "master"):
+        try:
+            merge_base = _git(worktree, "merge-base", "HEAD", trunk)
+        except RunnerBridgeError:
+            continue
+        if merge_base.strip() and merge_base.strip() != head:
+            return _git(worktree, "diff", f"{merge_base.strip()}..HEAD")
+    parents = _git(worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    if len(parents) >= 2:
+        return _git(worktree, "diff", f"{parents[1]}..HEAD")
+    return ""
 
 
 def _apply_scoped_edits(
@@ -523,6 +600,8 @@ def import_manual_review(
     publish or merge; Runner's qualification and operator-approval policies
     still apply.
     """
+    if len(verdict_json) > 1_000_000:
+        raise RunnerBridgeError("review submission exceeds the 1 MB ingestion bound")
     start, end = verdict_json.find("{"), verdict_json.rfind("}")
     if start == -1 or end <= start:
         raise RunnerBridgeError("review submission contains no JSON verdict object")
@@ -541,13 +620,16 @@ def import_manual_review(
             f"verdict is for candidate {submitted_sha}, but the current candidate is "
             f"{candidate_sha}; stale reviews are rejected — re-review the current candidate"
         )
+    findings = _bounded_findings(verdict.get("findings") or [])
     record = {
         "id": new_id("rev"),
         "job_id": job_id,
         "kind": "external_review",
         "source": "operator",
+        "provenance": "operator_provided",
+        "grants_publication_authority": False,
         "transport": transport,
-        "reviewer_claimed": str(verdict.get("reviewer", reviewer)),
+        "reviewer_claimed": str(verdict.get("reviewer", reviewer))[:MAX_TEXT_LEN],
         "decision": decision,
         "candidate_sha": candidate_sha,
         "verdict": redact_obj(verdict),
@@ -558,12 +640,36 @@ def import_manual_review(
         "decision": decision, "transport": transport, "candidate_sha": candidate_sha,
         "note": "operator-provided evidence, not an authenticated automated response",
     })
-    for finding in verdict.get("findings", []) or []:
-        if isinstance(finding, dict) and finding.get("title"):
-            store.add_finding(
-                job_id, f"external_review:{transport}", str(finding["title"]),
-                str(finding.get("severity", "medium")), 
-                [str(e) for e in finding.get("evidence", [])],
-                str(finding.get("detail", "")),
-            )
+    for finding in findings:
+        store.add_finding(
+            job_id, f"external_review:{transport}", finding["title"],
+            finding["severity"], finding["evidence"], finding["detail"],
+        )
     return record
+
+
+def _bounded_findings(raw: Any) -> list[dict[str, Any]]:
+    """Schema-validate and bound operator-submitted findings.
+
+    Oversized or malformed submissions are truncated/dropped, never trusted
+    wholesale: ingestion is bounded regardless of what the reviewer returns.
+    """
+    if not isinstance(raw, list):
+        return []
+    bounded: list[dict[str, Any]] = []
+    for item in raw[:MAX_FINDINGS]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        evidence_raw = item.get("evidence", []) or []
+        if not isinstance(evidence_raw, list):
+            evidence_raw = []
+        bounded.append({
+            "title": title[:MAX_TEXT_LEN],
+            "severity": str(item.get("severity", "medium"))[:32],
+            "evidence": [str(e)[:MAX_TEXT_LEN] for e in evidence_raw[:MAX_EVIDENCE_PER_FINDING]],
+            "detail": str(item.get("detail", ""))[:MAX_TEXT_LEN],
+        })
+    return bounded

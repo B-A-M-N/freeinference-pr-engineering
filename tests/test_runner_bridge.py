@@ -1,6 +1,8 @@
 """Runner bridge tests: role mapping, scope, SHA binding, idempotency, review."""
 
 import json
+import asyncio
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -19,6 +21,7 @@ from freeinference_pr.runner_bridge import (
     run_runner_task,
 )
 from freeinference_pr.store import Store
+from freeinference_pr.tools import ToolContext, ToolDenied, ToolRegistry
 
 
 @pytest.fixture()
@@ -318,3 +321,124 @@ def test_import_manual_review_rejects_bad_decision(tmp_path):
         import_manual_review(store, job["id"], "looks great to me",
                              candidate_sha="abc", reviewer="op", transport="manual")
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Mission 4 — qualification tests (contract, provenance, bounded ingestion)
+# ---------------------------------------------------------------------------
+
+
+async def test_result_file_matches_runner_collect_schema(tmp_path, worktree, monkeypatch):
+    """The result file must unmarshal directly into Runner's workers.Collect."""
+    EDITS = {"edits": [{"path": "src.py", "content": "VALUE = 2\n"}],
+             "commit_message": "bump", "regression_tests": [], "notes": ""}
+    patch_client(monkeypatch, lambda m, ms: fj(EDITS))
+    config = make_config(tmp_path)
+    pkg = make_pkg(worktree, packageFile=str(tmp_path / "art" / "att-1" / "task-package.json"))
+    result = await run_runner_task(pkg, config)
+    path = Path(pkg.packageFile + ".result.json")
+    data = json.loads(path.read_text())
+    assert set(data) >= {"runId", "state", "headSha", "result", "commits", "usage", "error"}
+    assert data["runId"] == result["run_id"]
+    assert data["state"] == "succeeded"
+    assert data["headSha"] == result["head_sha"]
+    assert data["commits"] == result["commits"]
+    assert set(data["usage"]) == {"usd", "known", "tokens", "detail"}
+    assert data["taskId"] == "task-1" and data["attemptId"] == "att-1"
+
+
+async def test_verifier_verdict_declares_self_review_provenance(tmp_path, worktree, monkeypatch):
+    """FI's own review must be labelled so Runner cannot treat it as independent
+    external review, and must never carry publication authority."""
+    REVIEW = {"assessment": "ok", "findings": [], "missed_paths": [], "unsupported_assumptions": []}
+    patch_client(monkeypatch, lambda m, ms: fj(REVIEW))
+    config = make_config(tmp_path)
+    result = await run_runner_task(make_pkg(worktree, role="verifier"), config)
+    verdict = json.loads(result["result"])["verdict"]
+    assert verdict["reviewer_provenance"] == "fi_self_review"
+    assert verdict["grants_publication_authority"] is False
+    assert verdict["evidence_kind"] == "fi_review"
+
+
+def test_implementer_role_denied_run_commands(tmp_path):
+    """Double enforcement: the role check refuses run_commands for implementer
+    even if a tool name were somehow reachable."""
+    registry = ToolRegistry()
+    ctx = ToolContext(job_id="j", task_id="t", role="implementer", worktree=tmp_path)
+    with pytest.raises(ToolDenied):
+        asyncio.run(registry.call(ctx, "run_commands", {"commands": ["ls"]}))
+
+
+async def test_scoped_edit_rejects_symlinked_target(tmp_path, worktree, monkeypatch):
+    """A path inside allowedPaths that is (or becomes) a symlink out of the
+    worktree must be refused by the resolved-path containment."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("original\n")
+    (worktree / "src.py").unlink()
+    (worktree / "src.py").symlink_to(outside)
+    EDITS = {"edits": [{"path": "src.py", "content": "VALUE = 2\n"}],
+             "commit_message": "bump", "regression_tests": [], "notes": ""}
+    patch_client(monkeypatch, lambda m, ms: fj(EDITS))
+    config = make_config(tmp_path)
+    result = await run_runner_task(make_pkg(worktree), config)
+    assert result["state"] == "failed"
+    assert "escapes worktree" in result["error"]
+    assert outside.read_text() == "original\n"
+
+
+def test_import_manual_review_ingestion_is_bounded(tmp_path):
+    store = Store(tmp_path / "s.db")
+    job = store.create_job("request", "octo/example", "obj")
+    sha = "a" * 40
+    findings = [{"title": f"f{i}", "severity": "low", "evidence": [f"e{j}" for j in range(100)],
+                 "detail": "d" * 9999} for i in range(80)]
+    findings.append({"not_a_dict": True})
+    findings.append({"title": "   "})
+    verdict = json.dumps({"decision": "changes_requested", "candidate_sha": sha,
+                          "findings": findings})
+    record = import_manual_review(store, job["id"], verdict,
+                                  candidate_sha=sha, reviewer="op", transport="manual")
+    assert record["provenance"] == "operator_provided"
+    assert record["grants_publication_authority"] is False
+    got = store.findings_for_job(job["id"])
+    assert len(got) == 50
+    assert len(got[0]["evidence"]) == 20
+    assert "d" * 4000 in got[0]["detail"] and "d" * 4001 not in got[0]["detail"]
+    store.close()
+
+
+def test_import_manual_review_rejects_oversized_submission(tmp_path):
+    store = Store(tmp_path / "s.db")
+    job = store.create_job("request", "octo/example", "obj")
+    verdict = json.dumps({"decision": "approve", "pad": "x" * 2_000_000})
+    with pytest.raises(RunnerBridgeError, match="ingestion bound"):
+        import_manual_review(store, job["id"], verdict,
+                             candidate_sha="a" * 40, reviewer="op", transport="manual")
+    store.close()
+
+
+async def test_verifier_diff_falls_back_to_trunk_merge_base(tmp_path, worktree, monkeypatch):
+    """When baseSha IS the candidate (Runner's verifier packages), the effective
+    diff comes from the trunk merge-base, not the empty baseSha diff."""
+    REVIEW = {"assessment": "ok", "findings": [], "missed_paths": [], "unsupported_assumptions": []}
+    patch_client(monkeypatch, lambda m, ms: fj(REVIEW))
+    config = make_config(tmp_path)
+    # implementer-style candidate commit on a branch off main
+    subprocess.run(["git", "-C", str(worktree), "checkout", "-q", "-b", "runner/task"], check=True)
+    (worktree / "src.py").write_text("VALUE = 2\n")
+    subprocess.run(["git", "-C", str(worktree), "add", "src.py"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "commit", "-q", "-m", "candidate"], check=True)
+    candidate = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+    # worktree currently on runner/task; trunk branch must exist for merge-base
+    subprocess.run(["git", "-C", str(worktree), "branch", "-f", "main", "HEAD~1"], check=True)
+    pkg = make_pkg(worktree, role="verifier", baseSha=candidate)
+    result = await run_runner_task(pkg, config)
+    assert result["state"] == "succeeded"
+    verdict = json.loads(result["result"])["verdict"]
+    assert verdict["candidate_sha"] == candidate
+    expected = subprocess.run(
+        ["git", "-C", str(worktree), "diff", f"{candidate}~1..{candidate}"],
+        capture_output=True, text=True).stdout
+    import hashlib
+    assert verdict["diff_digest"] == hashlib.sha256(expected.encode()).hexdigest()

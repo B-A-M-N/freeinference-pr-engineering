@@ -250,19 +250,24 @@ operator-provided, non-authenticated evidence.
 
 ## 6. Tests passed (this repo, mocked FI — real-FI smoke not run here: no key in sandbox)
 
-- Full suite: **105 passed** (`pytest -q`), including:
-  - `tests/test_runner_bridge.py` (19): role mapping (no GitHub tools), registry restriction, honest unsupported-role failure, non-git worktree rejection, **candidate SHA binding with zero FI calls on stale candidate**, scoped edits + commit + `head_sha`, allowed/forbidden path enforcement, idempotent replay, verifier verdict (decision / candidate_sha / 64-hex diff_digest / evidence_kind), blocker-based rejection, cancellation → `cancelled`, runner job persisted for restart recovery, path globs, package roundtrip, review packet contents, manual review import (operator evidence + findings + event note), stale-candidate rejection, malformed verdict rejection.
-  - `tests/test_integration_regressions.py` (13): strict approval identity matching (partial records, wrong branch/repo/PR, derived-operation bindings, cross-operation refusal), credential-free sandbox env, credential-free untrusted command execution, `..` traversal rejection, symlink escape rejection, non-destructive worktree recovery.
+- Full Python suite: **112 passed** (`pytest -q`), including:
+  - `tests/test_runner_bridge.py` (26): role mapping (no GitHub tools), registry restriction, honest unsupported-role failure, non-git worktree rejection, **candidate SHA binding with zero FI calls on stale candidate**, scoped edits + commit + `head_sha`, allowed/forbidden path enforcement, idempotent replay (result file rewritten with `replayed: true`), verifier verdict (decision / candidate_sha / 64-hex diff_digest / evidence_kind / `fi_self_review` provenance), implementer denied `run_commands`, symlinked-target edit rejection, bounded manual-review ingestion, oversized-submission rejection, verifier diff fallback to trunk merge-base, blocker-based rejection, cancellation → `cancelled`, runner job persisted for restart recovery, path globs, package roundtrip, review packet contents, manual review import (operator evidence + findings + event note), stale-candidate rejection, malformed verdict rejection, result-file Runner `Collect` schema.
+  - `tests/test_integration_regressions.py` (13): strict approval identity matching, credential-free sandbox env, credential-free untrusted command execution, `..` traversal rejection, symlink escape rejection, non-destructive worktree recovery.
   - All pre-existing Mission-2 tests still pass.
+- Go contract suite: **8/8 subtests pass** through Runner's real `CommandAdapter`
+  (see §8).
 
 ## 7. What remains unverified
 
 1. **Real FreeInference inference through the bridge** — the sandbox has no
-   `FREEINFERENCE_API_KEY`; run `fi-pr smoke` and one real `fi-pr runner-task`
-   on the user's machine.
-2. **End-to-end Runner↔FI integration** — Runner is local; the adapter has never
-   been dispatched by Runner. The command-adapter mechanism is verified from
-   Runner's public source, but the wiring (§4.1/4.2) is untested.
+   `FREEINFERENCE_API_KEY`. Run the live qualification on the user's machine:
+   `scripts/runner_qualification_live.sh` (disposable repo, planner →
+   implementer → verifier against real FI, no PR/push), or the Go harness in
+   live mode: `FI_LIVE=1 RUNNER_SRC=/home/bamn/Runner ./integration/runner/run_contract_tests.sh`.
+2. **Runner-side result ingestion** — Runner's `Collect` does not yet read
+   `{packageFile}.result.json`; the §4.2 Go change is still required on the
+   local hardening branch. The Go harness validates the result-file schema and
+   the adapter execution path, but not Runner's ingestion of it.
 3. **Local-branch Runner internals** — `secureexec` Bubblewrap flags,
    `review.go`, `verdict.go`, `qualification.go`, and the `VerdictFile` field are
    assumptions from the mission briefing; verify against the local checkout
@@ -272,3 +277,66 @@ operator-provided, non-authenticated evidence.
    required; until then the flow is operator-mediated.
 5. **HTTP-worker mode of the bridge** — not implemented (the command adapter is
    the integration path); do not advertise `POST /runs` capabilities.
+6. **Runner qualification machinery end-to-end** — the harness exercises the
+   adapter contract, not Runner's `scheduler/review.go` → `verification/`
+   pipeline; that requires the local hardening branch.
+
+## 8. Mission 4 — integration qualification (Go contract harness)
+
+### 8.1 Verified compatibility matrix
+
+| Contract element | Runner (GitHub `master`, verified) | FI bridge | Status |
+|---|---|---|---|
+| `TaskPackage` JSON | 23 camelCase fields (`internal/workers/workers.go`) | `RunnerTaskPackage` mirrors all 23 | ✅ verified via roundtrip + Go harness |
+| nil slices in Go JSON | marshaled as `null` | accepted → `[]` (`_null_list_to_empty` validator) | ✅ bug found by harness, fixed |
+| Dispatch | `sh -c` template, `cmd.Dir = pkg.Worktree`, all placeholders shell-quoted, package at `{artifactDir}/{attemptId}/task-package.json` | `fi-pr runner-task {{.PackageFile}}` | ✅ harness passes 8/8 |
+| Roles | `[implementer, verifier, planner]` | exact mapping, others fail honestly | ✅ |
+| Result | `Collect` does **not** read a result file (master) | writes `{packageFile}.result.json` in `Collect` JSON schema (camelCase, `runId/state/headSha/commits/usage{usd,known,tokens,detail}/error` + additive `taskId/attemptId/replayed`) | ✅ schema verified; Runner-side ingestion (§4.2) pending |
+| Idempotency | `IdempotencyKey` in package | replay returns prior result with `replayed: true`, no re-inference | ✅ harness: duplicate task → ≤1 FI call |
+| Cancel | SIGTERM process group, SIGKILL after 5s | subprocess terminates → state `cancelled` | ✅ harness |
+| Deadline | `context.WithTimeout` → failed "worker exceeded its time budget" | honest failure, no fake success | ✅ harness |
+| Candidate SHA | `baseSha`; `HeadSHA` via `git rev-parse HEAD` | stale candidate → zero inference, error `candidate SHA moved` | ✅ harness + pytest |
+| Verifier diff | verifier packages carry candidate SHA as `baseSha` (empty `git diff baseSha` is the *correct* case) | `_candidate_diff` fallback chain: `git diff baseSha` → trunk merge-base → parent commit | ✅ fixed (3rd discrepancy) |
+| Review provenance | FI self-review must not qualify as external review | verdict carries `reviewer_provenance: fi_self_review`, `grants_publication_authority: false`; manual imports carry `provenance: operator_provided` | ✅ implemented + tested |
+| Evidence ingestion | bounded, schema-validated | 1 MB submission bound; findings capped (50 findings × 20 evidence × 4000 chars) | ✅ tested |
+
+### 8.2 Discrepancies found by the real Go harness (and fixed)
+
+1. **Go nil slices → JSON `null`**: pydantic `list[str]` fields rejected `null`
+   → every task failed validation. Fixed with a `mode="before"` field validator
+   on `acceptance/nonGoals/allowedPaths/forbiddenPaths/evidence`.
+2. **Replay skipped the result file**: the idempotent-replay path returned the
+   prior result without re-running `_finish`, so the `Collect` result file was
+   never rewritten with `replayed: true`. Fixed.
+3. **Verifier packages carry the candidate SHA as `baseSha`**: `git diff
+   baseSha` is empty exactly when the binding is correct, so the verifier saw a
+   zero-length diff. Fixed with `_candidate_diff` (merge-base/parent fallbacks;
+   missing trunk branches are skipped, not fatal).
+
+### 8.3 Harness usage
+
+```bash
+# mocked-FI contract tests through Runner's real CommandAdapter
+# (copies RUNNER_SRC to a temp dir; never modifies the original)
+RUNNER_SRC=/home/bamn/Runner ./integration/runner/run_contract_tests.sh
+FI_KEEP_WORK=1   # preserve the temp Runner copy
+
+# live FreeInference model through the same harness (needs the key)
+FI_LIVE=1 RUNNER_SRC=/home/bamn/Runner ./integration/runner/run_contract_tests.sh
+
+# standalone live qualification (disposable repo, no PR, no push)
+FREEINFERENCE_API_KEY=... scripts/runner_qualification_live.sh
+```
+
+### 8.4 Phase-2 boundary notes
+
+- Runner owns the authoritative candidate SHA; FI's `diff_digest` is
+  **advisory** — Runner must independently compute the candidate diff digest
+  (§4.2) and treat adapter-produced evidence as claims, never as approval or
+  publication authority.
+- Untrusted work stays credential-free (`tools.py` sandbox env) and network-
+  isolated on the Runner side (`--unshare-net`); FI inference runs in the
+  adapter process only.
+- Scope enforcement is re-validated against traversal, symlink escapes, and
+  disallowed/forbidden paths at apply time (tested).
+
