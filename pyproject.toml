@@ -12,6 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
+fi-pr = "freeinference_pr.cli:main"
 freeinference-pr-worker = "freeinference_pr.worker:main"
 
 [dependency-groups]

@@ -77,9 +77,12 @@ class ToolContext:
 
 
 def _safe_path(root: Path, relative: str) -> Path:
+    resolved_root = root.resolve()
     target = (root / relative).resolve()
-    if not str(target).startswith(str(root.resolve())):
-        raise ToolError(f"path escapes workspace: {relative}")
+    try:
+        target.relative_to(resolved_root)
+    except ValueError:
+        raise ToolError(f"path escapes workspace: {relative}") from None
     return target
 
 
@@ -96,8 +99,7 @@ def _git(worktree: Path, *argv: str, timeout: int = 300) -> str:
 def _run_shell(worktree: Path, command: str, timeout: int = 1800) -> dict[str, Any]:
     proc = subprocess.run(
         command, shell=True, cwd=str(worktree), capture_output=True, text=True, timeout=timeout,
-        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(worktree),
-             "PYTHONDONTWRITEBYTECODE": "1", **_passthrough_env()},
+        env=_sandbox_env(worktree),
     )
     return {
         "command": command,
@@ -107,14 +109,22 @@ def _run_shell(worktree: Path, command: str, timeout: int = 1800) -> dict[str, A
     }
 
 
-def _passthrough_env() -> dict[str, str]:
+def _sandbox_env(worktree: Path) -> dict[str, str]:
+    """Minimal environment for untrusted test subprocesses.
+
+    Deliberately excludes FREEINFERENCE_API_KEY, GITHUB_TOKEN, and every other
+    credential: test code comes from the repository under evaluation and must
+    never be able to read or exfiltrate runtime credentials.
+    """
     import os
 
-    keep = {}
-    for name in ("FREEINFERENCE_API_KEY", "GITHUB_TOKEN", "GITHUB_API_URL"):
-        if os.environ.get(name):
-            keep[name] = os.environ[name]
-    return keep
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(worktree),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "TERM": "dumb",
+    }
 
 
 def _github_headers(ctx: ToolContext) -> dict[str, str]:

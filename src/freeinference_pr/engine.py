@@ -53,10 +53,13 @@ class Worktree:
 
     def apply_edits(self, edits: list[FileEdit]) -> list[str]:
         applied = []
+        resolved_root = self.path.resolve()
         for edit in edits:
             target = (self.path / edit.path).resolve()
-            if not str(target).startswith(str(self.path.resolve())):
-                raise RuntimeError(f"edit path escapes worktree: {edit.path}")
+            try:
+                target.relative_to(resolved_root)
+            except ValueError:
+                raise RuntimeError(f"edit path escapes worktree: {edit.path}") from None
             if edit.action == "delete":
                 target.unlink(missing_ok=True)
             else:
@@ -83,9 +86,24 @@ class Worktree:
 def prepare_worktree(
     workspace_root: Path, job_id: str, repository: str, base_ref: str, branch: str
 ) -> Worktree:
+    """Prepare (or reuse) the job's isolated checkout.
+
+    Recovery-safe: an existing checkout is reused, never deleted. Completed
+    commits from an interrupted run must survive a restart; re-cloning would
+    destroy them. Re-clone happens only when the directory is missing or not a
+    usable git repository.
+    """
     repo_dir = workspace_root / job_id / "repo"
+    if repo_dir.exists() and (repo_dir / ".git").exists():
+        worktree = Worktree(repo_dir, repository, base_ref, branch)
+        branches = worktree.git("branch", "--list", branch).strip()
+        if branches:
+            worktree.git("switch", branch)
+            return worktree
+        worktree.git("switch", "-c", branch)
+        return worktree
     if repo_dir.exists():
-        subprocess.run(["rm", "-rf", str(repo_dir.parent)], check=True)
+        subprocess.run(["rm", "-rf", str(repo_dir)], check=True)
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "clone", "--quiet", f"https://github.com/{repository}.git", str(repo_dir)],

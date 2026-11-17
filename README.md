@@ -36,6 +36,32 @@ fi-pr doctor                             runtime health checks
 fi-pr smoke                              real FreeInference integration smoke test
 ```
 
+## Runner-managed mode
+
+The same codebase can run as a specialized worker subsystem inside the local
+[Runner](https://github.com/B-A-M-N/runner) application: Runner owns task
+lifecycle, scheduling, worktrees, approvals, and completion authority; FI
+supplies the multi-agent engineering capability through the existing free
+FreeInference access. Runner dispatches a TaskPackage; the bridge executes
+exactly that bounded task (no scheduling, no GitHub tools, no publication) and
+returns a SHA-bound, idempotent result.
+
+```
+fi-pr runner-task package.json        # execute one Runner task package
+fi-pr review-packet job_xxxxx         # copyable external review packet
+fi-pr review-import job_xxxxx v.json --candidate-sha SHA --reviewer R --transport T
+```
+
+Role mapping: Runner `planner` → repository analyst, `implementer` →
+implementer, `verifier` → verifier/security review. Edits are confined to the
+package's `allowedPaths`/`forbiddenPaths`; worktree HEAD must match the
+package's `baseSha` before any inference call; results replay idempotently per
+`idempotencyKey`; `maxMinutes` is enforced. External reviews (ChatGPT via the
+Kontrol rendezvous, Gemini, Mistral user-facing sessions) are operator-mediated
+and recorded as operator-provided evidence — never as publish authority. See
+[docs/RUNNER_INTEGRATION.md](docs/RUNNER_INTEGRATION.md) for the verified-vs-
+assumed contract split and exact Runner-side integration steps.
+
 ### How a job runs
 
 ```
@@ -112,21 +138,23 @@ src/freeinference_pr/
   approvals.py       approval gate (single enforcement point for privileged operations)
   engine.py          deterministic stage machine + scheduling + worktrees + publishing
   cli.py             fi-pr command-line interface
+  runner_bridge.py   Runner-managed mode: task-package adapter, review packets, manual review import
   smoke.py           real-FI integration smoke test
   redaction.py       secret redaction for traces, logs, tool results
   provider.py, role_agents.py, pr_workflow.py, ...   preserved optional Mistral managed path
 docs/
   INDEPENDENT_RUNTIME.md   architecture, guarantees, limitations
+  RUNNER_INTEGRATION.md    Runner worker-subsystem integration (verified vs. assumed contract)
   INVENTORY.md             preserved-work inventory (commit 0fb6298 baseline)
   DEPLOYMENT.md            optional Mistral managed path
-tests/               73 offline tests (mocked FI, fake GitHub, local git fixtures)
+tests/               105 offline tests (mocked FI, fake GitHub, local git fixtures)
 ```
 
 ## Development
 
 ```bash
 uv sync
-uv run pytest          # 73 offline tests; no network, no keys needed
+uv run pytest          # 105 offline tests; no network, no keys needed
 ```
 
 Tests are offline by design: FreeInference is mocked at the HTTP boundary,

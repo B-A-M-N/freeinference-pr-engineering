@@ -211,6 +211,99 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
     return await run_smoke(FIConfig())
 
 
+async def cmd_runner_task(args: argparse.Namespace) -> int:
+    """Runner-managed execution mode: run one Runner TaskPackage with FI agents."""
+    from freeinference_pr.runner_bridge import load_package, run_runner_task
+
+    config = FIConfig()
+    if not config.api_key:
+        print("error: FREEINFERENCE_API_KEY is not set", file=sys.stderr)
+        return 2
+    try:
+        pkg = load_package(args.package)
+    except Exception as exc:  # noqa: BLE001 - invalid packages are honest failures
+        print(f"error: invalid Runner task package: {exc}", file=sys.stderr)
+        return 2
+    result = await run_runner_task(pkg, config)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("state") == "succeeded" else 1
+
+
+def cmd_review_packet(args: argparse.Namespace) -> int:
+    """External review handoff: render a copyable packet from a job's evidence."""
+    from freeinference_pr.runner_bridge import build_review_packet
+
+    config = FIConfig()
+    store = Store(config.state_path)
+    try:
+        job = store.get_job(args.job_id)
+        verifications = store.verifications_for_job(args.job_id)
+        test_results = [
+            {"command": c, "exit_code": code}
+            for v in verifications for c, code in zip(v["commands"], v["exit_codes"])
+        ]
+        diff = ""
+        worktree_ref = store.idempotency_get(f"worktree:{args.job_id}")
+        if worktree_ref and Path(worktree_ref["path"]).exists():
+            import subprocess
+
+            wt = worktree_ref["path"]
+            ref = worktree_ref.get("base_ref") or "HEAD"
+            proc = subprocess.run(["git", "-C", wt, "diff", ref],
+                                  capture_output=True, text=True, timeout=120)
+            diff = proc.stdout
+        commit = next((a["ref"] for a in reversed(store.artifacts_for_job(args.job_id))
+                       if a["kind"] == "commit"), "")
+        packet = build_review_packet(
+            repository=job["repository"],
+            task_identity=f"job {args.job_id} ({job['kind']})",
+            candidate_sha=commit,
+            base_sha="",
+            objective=job["objective"],
+            diff=diff,
+            test_results=test_results,
+            known_risks=[f["title"] for f in store.findings_for_job(args.job_id)],
+            review_questions=[
+                "Are there correctness defects in the diff?",
+                "Are there security issues (input handling, authz, secrets)?",
+                "Are there missed production paths or unsupported assumptions?",
+            ],
+            reviewer_hint=args.reviewer or "manual handoff",
+        )
+    finally:
+        store.close()
+    if args.out:
+        Path(args.out).write_text(packet)
+        print(f"review packet written to {args.out}")
+    else:
+        print(packet)
+    return 0
+
+
+def cmd_review_import(args: argparse.Namespace) -> int:
+    """Record an operator-submitted external review verdict for a job."""
+    from freeinference_pr.runner_bridge import RunnerBridgeError, import_manual_review
+
+    config = FIConfig()
+    store = Store(config.state_path)
+    try:
+        job = store.get_job(args.job_id)
+        commit = next((a["ref"] for a in reversed(store.artifacts_for_job(args.job_id))
+                       if a["kind"] == "commit"), "")
+        verdict = Path(args.file).read_text()
+        record = import_manual_review(
+            store, args.job_id, verdict, candidate_sha=commit,
+            reviewer=args.reviewer or "operator", transport=args.transport,
+        )
+        print(json.dumps(record, indent=2, default=str))
+    except RunnerBridgeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fi-pr", description="FreeInference PR engineering system")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -252,6 +345,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke = sub.add_parser("smoke", help="real FreeInference integration smoke test")
     smoke.set_defaults(func=cmd_smoke)
+
+    runner_task = sub.add_parser("runner-task",
+                                 help="Runner-managed mode: execute one Runner task package")
+    runner_task.add_argument("package", help="path to the Runner task-package JSON file")
+    runner_task.set_defaults(func=cmd_runner_task)
+
+    review_packet = sub.add_parser("review-packet",
+                                   help="render a copyable external review packet for a job")
+    review_packet.add_argument("job_id")
+    review_packet.add_argument("--out", help="write the packet to a file instead of stdout")
+    review_packet.add_argument("--reviewer", help="reviewer transport hint (kontrol/chatgpt/gemini/mistral)")
+    review_packet.set_defaults(func=cmd_review_packet)
+
+    review_import = sub.add_parser("review-import",
+                                   help="record an operator-submitted external review verdict")
+    review_import.add_argument("job_id")
+    review_import.add_argument("file", help="file containing the verdict JSON")
+    review_import.add_argument("--reviewer", default="operator")
+    review_import.add_argument("--transport", default="manual",
+                               help="how the review was performed (kontrol/chatgpt/gemini/mistral/manual)")
+    review_import.set_defaults(func=cmd_review_import)
     return parser
 
 
