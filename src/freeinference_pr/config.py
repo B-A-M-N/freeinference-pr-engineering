@@ -61,11 +61,24 @@ class FIConfig:
     # --- inference ---------------------------------------------------------
     @property
     def api_key(self) -> str:
-        return self.get("FREEINFERENCE_API_KEY", "")
+        # Provider-agnostic: the key's env-var NAME is configurable, so the
+        # same OpenAI-compatible client serves FreeInference, Mistral
+        # (FI_API_KEY_ENV=MISTRAL_API_KEY), or any other harness.
+        return self.get(self.get("FI_API_KEY_ENV", "FREEINFERENCE_API_KEY"), "")
 
     @property
     def base_url(self) -> str:
         return self.get("FREEINFERENCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+    @property
+    def inference_socket(self) -> str:
+        """Path to a task-scoped Unix-socket inference broker (Runner mode).
+
+        When set, all inference travels as HTTP over this socket: the sandboxed
+        worker gets no network access and no API key — the broker process alone
+        holds both. Fail-closed semantics live broker-side.
+        """
+        return self.get("FI_INFERENCE_SOCKET", "")
 
     @property
     def max_concurrent(self) -> int:

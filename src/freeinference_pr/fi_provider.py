@@ -118,8 +118,15 @@ class FreeInferenceClient:
         headers = {"Content-Type": "application/json", "User-Agent": "freeinference-pr-engineering"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
+        base_url = config.base_url
+        if config.inference_socket and transport is None:
+            # Task-scoped inference broker (Runner sandbox mode): HTTP over a
+            # Unix domain socket. The sandboxed worker gets no network and no
+            # API key; the broker process alone holds both.
+            transport = httpx.AsyncHTTPTransport(uds=config.inference_socket)
+            base_url = "http://fi.broker"
         self._client = httpx.AsyncClient(
-            base_url=config.base_url, headers=headers, timeout=config.request_timeout,
+            base_url=base_url, headers=headers, timeout=config.request_timeout,
             transport=transport,
         )
 

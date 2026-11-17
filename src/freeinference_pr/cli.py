@@ -366,7 +366,17 @@ def build_parser() -> argparse.ArgumentParser:
     review_import.add_argument("--transport", default="manual",
                                help="how the review was performed (kontrol/chatgpt/gemini/mistral/manual)")
     review_import.set_defaults(func=cmd_review_import)
+
+    acp = sub.add_parser("acp",
+                         help="serve PR engineering missions over the Agent Client Protocol (stdio)")
+    acp.set_defaults(func=cmd_acp)
     return parser
+
+
+def cmd_acp(args: argparse.Namespace) -> int:
+    from freeinference_pr.acp_server import ACPServer
+
+    return ACPServer(FIConfig()).serve()
 
 
 def main(argv: list[str] | None = None) -> int:

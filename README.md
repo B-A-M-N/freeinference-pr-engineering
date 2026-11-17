@@ -36,6 +36,32 @@ fi-pr doctor                             runtime health checks
 fi-pr smoke                              real FreeInference integration smoke test
 ```
 
+## Pluggable inference backends (Mistral, ACP, broker)
+
+Any object with `chat()`/`close()` satisfies the client contract, so backends
+are swappable without touching agent, engine, or bridge code:
+
+- **OpenAI-compatible HTTP** (default): FreeInference, or Mistral via
+  `FI_API_KEY_ENV=MISTRAL_API_KEY` + `FREEINFERENCE_BASE_URL=https://api.mistral.ai/v1`.
+- **ACP agent backend**: set `FI_ACP_COMMAND` to any Agent Client Protocol
+  agent (JSON-RPC over stdio; contract verified against Kontrol's duplex
+  implementation) and it becomes the inference source. Text-mode: the agent
+  runs its own tools; usage is reported as unknown.
+- **Unix-socket broker**: `FI_INFERENCE_SOCKET` routes HTTP inference over a
+  task-scoped Unix domain socket — the sandboxed worker gets no network and
+  no API key (Runner sandbox mode).
+
+## ACP server (other harnesses can drive this system)
+
+`fi-pr acp` serves the agent side of ACP over stdio, so any ACP-speaking
+harness (Kontrol, Zed-compatible agents, custom duplex adapters) can drive PR
+missions: `initialize` -> `session/new` -> `session/prompt` with text commands
+(`status [job]`, `approve <id>`, `reject <id>`, `cancel <job>`, or a free-form
+request containing an `owner/repo` reference). Progress streams as
+`session/update` notifications. Prompt text is treated as untrusted data;
+fs/terminal agent calls are refused (fail closed); publication still requires
+a recorded approval.
+
 ## Runner-managed mode
 
 The same codebase can run as a specialized worker subsystem inside the local
